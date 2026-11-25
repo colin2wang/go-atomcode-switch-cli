@@ -1,0 +1,10 @@
+# 构建产物（make build / make release）
+/atomcode-switch-cli
+/dist/
+
+# AI 编码器本地状态
+.atomcode/
+.codebuddy/
+
+# IDE
+.idea/

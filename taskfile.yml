@@ -1,0 +1,154 @@
+version: '3'
+
+vars:
+  APP: atomcode-switch-cli
+  VERSION:
+    sh: git describe --tags --always 2>/dev/null || echo dev
+  LDFLAGS: '-s -w -X main.version={{.VERSION}}'
+  HOST_OS:
+    sh: go env GOOS
+  HOST_ARCH:
+    sh: go env GOARCH
+  # 交叉编译平台矩阵，新增平台直接加在这里
+  PLATFORMS:
+    - linux/amd64
+    - linux/arm64
+    - darwin/amd64
+    - darwin/arm64
+    - windows/amd64
+
+tasks:
+  default:
+    desc: 查看任务列表
+    silent: true
+    cmds:
+      - task --list
+
+  # ================= 代码检查 & 测试 =================
+  fmt:
+    desc: gofmt 格式化代码
+    cmds:
+      - gofmt -w .
+
+  fmt-check:
+    desc: 格式检查（CI）
+    cmds:
+      - test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+  vet:
+    desc: go vet 静态检查
+    cmds:
+      - go vet ./...
+
+  test:
+    desc: 单元测试，跳过缓存
+    cmds:
+      - go test -count=1 ./...
+
+  test-race:
+    desc: 竞态检测
+    cmds:
+      - go test -race -count=1 ./...
+
+  check:
+    desc: 提交前全套检查：fmt-check + vet + test
+    cmds:
+      - task: fmt-check
+      - task: vet
+      - task: test
+
+  install:
+    desc: go install 安装到 GOPATH/bin
+    cmds:
+      - go install -trimpath -ldflags "{{.LDFLAGS}}" ./cmd/atomcode-switch-cli
+
+  version:
+    desc: 打印当前版本号
+    cmds:
+      - echo {{.VERSION}}
+
+  # ================= 清理 =================
+  clean:
+    desc: 删除 dist 目录
+    cmds:
+      - cmd: rm -rf dist
+        platforms: [linux, darwin]
+      - cmd: cmd /c "if exist dist rmdir /s /q dist"
+        platforms: [windows]
+
+  # ================= 构建入口（统一 build，支持平台参数 / ALL=true / build-all） =================
+  build:
+    desc: 编译 release 版本输出到 dist；用法：task build [PLATFORM=xxx/xxx] [ALL=true]
+    deps:
+      - task: '{{if .ALL}}{{if eq .ALL "true"}}build-all{{else}}build-one{{end}}{{else}}build-one{{end}}'
+        vars:
+          PLATFORM: '{{if .PLATFORM}}{{.PLATFORM}}{{else}}{{.HOST_OS}}/{{.HOST_ARCH}}{{end}}'
+
+  build-all:
+    desc: 编译 PLATFORMS 中的全部平台到 dist
+    cmds:
+      - task: clean
+      - for: { var: PLATFORMS }
+        task: compile-one
+        vars:
+          PLATFORM: '{{.ITEM}}'
+
+  build-one:
+    internal: true
+    cmds:
+      - task: clean
+      - task: compile-one
+        vars:
+          PLATFORM: '{{.PLATFORM}}'
+
+  compile-one:
+    internal: true
+    vars:
+      OS: '{{ index (splitList "/" .PLATFORM) 0 }}'
+      ARCH: '{{ index (splitList "/" .PLATFORM) 1 }}'
+      EXT: '{{ if eq .OS "windows" }}.exe{{ end }}'
+    preconditions:
+      - sh: test -n "{{.PLATFORM}}"
+        msg: "缺少 PLATFORM，格式示例：PLATFORM=linux/arm64"
+    cmds:
+      - task: dist-dir
+      - CGO_ENABLED=0 GOOS={{.OS}} GOARCH={{.ARCH}} go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/{{.APP}}-{{.OS}}-{{.ARCH}}{{.EXT}} ./cmd/atomcode-switch-cli
+      - go version -m dist/{{.APP}}-{{.OS}}-{{.ARCH}}{{.EXT}}
+
+  dist-dir:
+    internal: true
+    run: once
+    cmds:
+      - cmd: mkdir -p dist
+        platforms: [linux, darwin]
+      - cmd: cmd /c "if not exist dist mkdir dist"
+        platforms: [windows]
+
+  # ================= 打包归档 & 校验 =================
+  package-one:
+    internal: true
+    vars:
+      OS: '{{ index (splitList "/" .PLATFORM) 0 }}'
+      ARCH: '{{ index (splitList "/" .PLATFORM) 1 }}'
+      EXT: '{{ if eq .OS "windows" }}.exe{{ end }}'
+    cmds:
+      - cmd: tar -czf dist/{{.APP}}-{{.OS}}-{{.ARCH}}.tar.gz -C dist {{.APP}}-{{.OS}}-{{.ARCH}}{{.EXT}}
+        platforms: [linux, darwin]
+      - cmd: powershell -NoProfile -Command "Compress-Archive -Path dist/{{.APP}}-{{.OS}}-{{.ARCH}}{{.EXT}} -DestinationPath dist/{{.APP}}-{{.OS}}-{{.ARCH}}.zip -Force"
+        platforms: [windows]
+
+  package:
+    desc: 打包 dist 内所有二进制（tar.gz / zip）
+    cmds:
+      - for: { var: PLATFORMS }
+        task: package-one
+        vars:
+          PLATFORM: '{{.ITEM}}'
+
+  checksum:
+    desc: 生成 dist 目录 SHA256 校验文件
+    cmds:
+      - cmd: shasum -a 256 dist/* > dist/SHA256SUMS
+        platforms: [linux, darwin]
+      - cmd: powershell -NoProfile -Command "Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | Format-Table Hash, Path | Out-File dist/SHA256SUMS.txt"
+        platforms: [windows]
